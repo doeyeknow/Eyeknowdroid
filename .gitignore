@@ -1,0 +1,13 @@
+# Signing material — NEVER commit (this repo is public).
+*.keystore
+keystore-credentials.txt
+*.jks
+
+# Build outputs + the APK itself.
+build/
+*.apk
+
+# Secrets / local config.
+.env
+*.env
+local.properties
