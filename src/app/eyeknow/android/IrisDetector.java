@@ -346,7 +346,75 @@ public final class IrisDetector {
     private static final class Trace {
         final float validFrac;
         final float r;
-        Trace(float validFrac, float r) { this.validFrac = validFrac; this.r = r; }
+        /** Spread of the valid ray radii: (p90-p10)/median.
+         *  1.0 when too few rays were valid to judge. A circle
+         *  centered on the trace origin has a small spread; an
+         *  off-center circle's radii vary widely. */
+        final float spread;
+        Trace(float validFrac, float r, float spread) {
+            this.validFrac = validFrac;
+            this.r = r;
+            this.spread = spread;
+        }
+    }
+
+    /** Result of tracing the iris edge from the frame center
+     *  (the verification path's view — see
+     *  {@link #traceFromCenter}). */
+    public static final class CenterTrace {
+        /** Median traced edge radius, frame pixels. */
+        public final float irisR;
+        /** Fraction of rays that truly found the iris edge. */
+        public final float validFrac;
+        /** Spread of the valid ray radii: (p90-p10)/median.
+         *  Small when the iris is centered on the frame. */
+        public final float spread;
+
+        public CenterTrace(float irisR, float validFrac, float spread) {
+            this.irisR = irisR;
+            this.validFrac = validFrac;
+            this.spread = spread;
+        }
+    }
+
+    /**
+     * Trace the iris edge from the EXACT frame center, using the
+     * same ray machinery, scoring, ratios, and fallback chain as
+     * {@link #detect} — the seed radius is the detector's own
+     * estimate radius (minDim * 0.085, the no-pupil path's
+     * value), not a new constant.
+     *
+     * This is the post-crop verification signal (v1.4): the
+     * question is "is the iris centered and fully inside THIS
+     * crop?", and the center trace answers it directly. The
+     * pupil-blob estimate cannot be trusted for this on real
+     * dark eyes — on Adam's mis-framed photo the blob lands on
+     * a dark iris patch, not the pupil (the flash reflection
+     * plus the dark-brown iris leave no clean luminance blob),
+     * and on re-centered versions of the same photo it
+     * alternates between no-pupil, correct, and wrong-blob
+     * across scales — while the center trace stays consistent
+     * (see the harness fixture leg, which pins this). The
+     * center trace has no pupil dependency at all: a centered
+     * iris gives a high validFrac, a tight radius spread, and a
+     * radius in band; a cut or displaced iris fails at least
+     * one of the three.
+     */
+    public static CenterTrace traceFromCenter(IrisFrame frame) {
+        int minDim = frame.minDim();
+        float cx = frame.width / 2f;
+        float cy = frame.height / 2f;
+        float rp = minDim * 0.085f;
+        Trace traced = traceEdges(frame, cx, cy, rp, 0.45f);
+        if (traced.validFrac < 0.45f) {
+            Trace lenient = traceEdges(frame, cx, cy, rp, 0.62f);
+            if (lenient.validFrac > traced.validFrac) traced = lenient;
+        }
+        if (traced.validFrac < 0.3f) {
+            Trace gradient = traceEdgesGradient(frame, cx, cy, rp);
+            if (gradient.validFrac > traced.validFrac) traced = gradient;
+        }
+        return new CenterTrace(traced.r, traced.validFrac, traced.spread);
     }
 
     private static float edgeScore(IrisFrame frame, float x, float y) {
@@ -421,7 +489,16 @@ public final class IrisDetector {
         float vf = (float) radii.size() / RAYS;
         float r = radii.size() >= 12 ? median(radii) : minDim * 0.3f;
         r = Math.min(Math.max(r, rp * 1.9f), maxR);
-        return new Trace(vf, r);
+        float spread = 1f;
+        if (radii.size() >= 12) {
+            List<Float> s = new ArrayList<>(radii);
+            s.sort(Float::compareTo);
+            float med = s.get(s.size() / 2);
+            float p10 = s.get((int) Math.floor(s.size() * 0.10));
+            float p90 = s.get(Math.min(s.size() - 1, (int) Math.ceil(s.size() * 0.90)));
+            spread = med > 0 ? (p90 - p10) / med : 1f;
+        }
+        return new Trace(vf, r, spread);
     }
 
     // ------------------------------------------------------------ quality

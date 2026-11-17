@@ -65,9 +65,16 @@ import java.util.List;
  *   shutter button always stays available, and auto-capture can
  *   be toggled off; it never captures a frame the detector
  *   rejected.
- * - A still capture goes to the crop step; the cropped photo
- *   returns to MainActivity as a file path (never a Binder extra
- *   — a JPEG data URL would blow the transaction limit).
+ * - Auto-crop + auto-submit (v1.2): a gate-fired still is
+ *   cropped automatically to the detected iris bounds and
+ *   submitted through the same bridge path as a manual confirm
+ *   — no crop screen on the auto path. When the crop mapping
+ *   cannot be computed safely, the photo falls back to the
+ *   manual crop screen instead of submitting a bad crop.
+ * - A manual still capture goes to the crop step; the cropped
+ *   photo returns to MainActivity as a file path (never a
+ *   Binder extra — a JPEG data URL would blow the transaction
+ *   limit).
  *
  * States are shown honestly throughout; every failure path ends
  * in RESULT_ERROR with the real reason.
@@ -81,11 +88,17 @@ public class CameraActivity extends Activity {
     public static final int RESULT_ERROR = RESULT_FIRST_USER + 1;
 
     private static final int REQ_CROP = 4201;
+
+    /** Last-attempt diagnostics storage (v1.4): one record,
+     *  numbers only, app-private, never transmitted. */
+    private static final String DIAG_PREFS = "eyeknow_camera_diag";
+    private static final String DIAG_KEY = "last_autocrop";
     private static final String TAG = "EyeknowCamera";
 
     private TextureView textureView;
     private GuideOverlay guideOverlay;
     private TextView statusLine;
+    private TextView diagLine;
     private TextView cameraLine;
     private TextView zoomLabel;
     private SeekBar zoomSlider;
@@ -115,6 +128,7 @@ public class CameraActivity extends Activity {
     private Size stillSize;
 
     private String cameraId;
+    private String cameraLabel = "";
     private Rect activeArray;
     private float maxZoom = 1f;
     private float zoomFactor = 1f;
@@ -129,6 +143,19 @@ public class CameraActivity extends Activity {
     private int lastAfState = -1;
     private boolean scaling;
     private File pendingRawFile;
+    // Auto-capture fire state (v1.2): whether the pending still
+    // was gate-fired, the firing detection (the most recent
+    // passing frame — the one that completed the stability
+    // window), and the JPEG_ORIENTATION actually used for the
+    // still. The auto-crop mapping needs all of it; the manual
+    // path never reads these.
+    private boolean autoFired;
+    private float fireCx;
+    private float fireCy;
+    private float fireIrisR;
+    private int fireFrameW;
+    private int fireFrameH;
+    private int stillOrientation;
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {
@@ -171,6 +198,12 @@ public class CameraActivity extends Activity {
         top.setPadding(pad, pad, pad, pad);
         cameraLine = line(top, "");
         statusLine = line(top, "Opening camera…");
+        // Last auto-crop check, when one has been recorded (v1.4
+        // diagnostics): one small dim line, hidden until the
+        // first auto attempt. Numbers only, never a photo.
+        diagLine = line(top, "");
+        diagLine.setTextSize(12f);
+        diagLine.setVisibility(View.GONE);
         FrameLayout.LayoutParams topLp = new FrameLayout.LayoutParams(-1, -2);
         topLp.gravity = Gravity.TOP;
         root.addView(top, topLp);
@@ -197,7 +230,7 @@ public class CameraActivity extends Activity {
         torchButton.setOnClickListener(v -> toggleTorch());
         captureButton = new Button(this);
         captureButton.setText("Capture " + ("left".equals(eye) ? "left" : "right") + " eye");
-        captureButton.setOnClickListener(v -> captureStill());
+        captureButton.setOnClickListener(v -> captureStill(false));
         autoButton = new Button(this);
         autoButton.setOnClickListener(v -> toggleAutoCapture());
         Button cancel = new Button(this);
@@ -378,6 +411,7 @@ public class CameraActivity extends Activity {
             analysisSize = pickAnalysisSize(map.getOutputSizes(ImageFormat.YUV_420_888));
             autoAvailable = analysisSize != null;
             torchOn = backFacing && hasFlash; // torch on by default, rear only
+            cameraLabel = choice.label;
             runOnUiThread(() -> {
                 cameraLine.setText(choice.label + " camera — " + choice.reason);
                 torchButton.setText("Flash: " + (torchOn ? "on" : "off"));
@@ -518,6 +552,18 @@ public class CameraActivity extends Activity {
             }
             previewBuilder = cameraDevice.createCaptureRequest(CameraDevice.TEMPLATE_PREVIEW);
             previewBuilder.addTarget(previewSurface);
+            // v1.2 fix: the analysis surface MUST be a target of
+            // the repeating request, or it never receives a
+            // frame — a surface in the session outputs alone gets
+            // nothing. v1.1 omitted this target, so analyzeFrame
+            // never ran and the gate could never fire; every v1.1
+            // photo that reached the crop screen came from the
+            // manual shutter. The retry path (no analysis) builds
+            // a fresh builder with analysisReader null, so no
+            // stale target can survive it.
+            if (analysisReader != null) {
+                previewBuilder.addTarget(analysisReader.getSurface());
+            }
             applyPreviewSettings(previewBuilder);
             cameraDevice.createCaptureSession(
                     targets,
@@ -584,7 +630,7 @@ public class CameraActivity extends Activity {
                     planes[2].getBuffer(), planes[2].getRowStride(), planes[2].getPixelStride());
             IrisDetector.Result r = IrisDetector.detect(frame);
             AutoCaptureGate.State state = gate.feed(r, afFocused, afKnown);
-            onGateState(state, r);
+            onGateState(state, r, frame.width, frame.height);
         } catch (Exception ignored) {
             // Analysis failures stay silent; the manual shutter remains.
         } finally {
@@ -593,9 +639,11 @@ public class CameraActivity extends Activity {
     }
 
     /** Gate states drive the status line while auto-capture is
-     *  active. The FIRED state takes the still through the exact
-     *  manual path — crop step included. */
-    private void onGateState(AutoCaptureGate.State state, IrisDetector.Result r) {
+     *  active. The FIRED state stashes the firing detection and
+     *  takes the still on the AUTO path (v1.2: auto-crop +
+     *  auto-submit, no crop screen). */
+    private void onGateState(AutoCaptureGate.State state, IrisDetector.Result r,
+                             int frameW, int frameH) {
         runOnUiThread(() -> {
             switch (state) {
                 case SEARCHING:
@@ -616,8 +664,28 @@ public class CameraActivity extends Activity {
                             + "/" + AutoCaptureGate.STEADY_FRAMES);
                     break;
                 case FIRED:
-                    setStatus("Captured.");
-                    captureStill();
+                    // The firing frame is the most recent passing
+                    // detection — the one that completed the
+                    // stability window. Stash it for the crop
+                    // mapping before the still fires. captureStill
+                    // owns autoFired: if a manual capture is
+                    // already in flight, this fire is dropped and
+                    // the manual photo keeps the crop step.
+                    fireCx = r.cx;
+                    fireCy = r.cy;
+                    fireIrisR = r.irisR;
+                    fireFrameW = frameW;
+                    fireFrameH = frameH;
+                    // v1.4 sequencing fix: the gate firing is NOT
+                    // a capture — the still is taken after this,
+                    // and saying "Captured." here made the user
+                    // relax and move before the shutter, shifting
+                    // the frame at macro distance. "Hold still"
+                    // until the still bytes are saved (see
+                    // CaptureStatus — the sequence is pinned by
+                    // the harness).
+                    setStatus(CaptureStatus.text(CaptureStatus.Phase.FIRING));
+                    captureStill(true);
                     break;
             }
         });
@@ -792,10 +860,18 @@ public class CameraActivity extends Activity {
         }
     }
 
-    private void captureStill() {
+    /** Fire the still. {@code auto} marks a gate-fired capture
+     *  (auto-crop + auto-submit); the manual shutter passes false
+     *  and keeps the crop step. The JPEG_ORIENTATION actually
+     *  used is stashed: the auto-crop mapping must use the
+     *  rotation the still was taken with, not a recomputation. */
+    private void captureStill(boolean auto) {
         if (capturing || cameraDevice == null || captureSession == null) return;
         capturing = true;
-        setStatus("Capturing… hold still.");
+        autoFired = auto;
+        // Same honest text on both paths: capturing, not
+        // captured — the still has not been taken yet.
+        setStatus(CaptureStatus.text(CaptureStatus.Phase.CAPTURING));
         try {
             CaptureRequest.Builder b =
                     cameraDevice.createCaptureRequest(CameraDevice.TEMPLATE_STILL_CAPTURE);
@@ -809,7 +885,8 @@ public class CameraActivity extends Activity {
                         ? CaptureRequest.FLASH_MODE_TORCH : CaptureRequest.FLASH_MODE_OFF);
             }
             applyZoom(b);
-            b.set(CaptureRequest.JPEG_ORIENTATION, jpegOrientation());
+            stillOrientation = jpegOrientation();
+            b.set(CaptureRequest.JPEG_ORIENTATION, stillOrientation);
             b.set(CaptureRequest.JPEG_QUALITY, (byte) 95);
             captureSession.capture(b.build(), new CameraCaptureSession.CaptureCallback() {
                 @Override
@@ -851,17 +928,183 @@ public class CameraActivity extends Activity {
         }
         pendingRawFile = raw;
         capturing = false;
+        if (autoFired) {
+            // Auto path (v1.2): crop to the detected iris and
+            // submit — no crop screen. Any failure here falls
+            // back to the manual crop screen, never a dead end.
+            autoFired = false;
+            tryAutoCrop(raw);
+            return;
+        }
+        openCropScreen(raw, false, null);
+    }
+
+    /** Auto-crop + verify + auto-submit for a gate-fired still.
+     *  Runs on the camera background thread (saveStill's thread):
+     *  the crop encode and the verification happen here, and
+     *  only the finish crosses to the UI thread. Every failure
+     *  — null mapping, encode failure, verification failure,
+     *  verification error — falls back to the manual crop
+     *  screen with the raw photo intact and a diagnostics
+     *  record explaining why. Nothing here can crash the
+     *  capture: a rejected crop is deleted, the raw is kept,
+     *  and the user still gets to submit, framing it
+     *  themselves. */
+    private void tryAutoCrop(File raw) {
+        // The still bytes are saved: only now may the status
+        // say the photo exists (v1.4 sequencing fix).
+        setStatus(CaptureStatus.text(CaptureStatus.Phase.SAVED));
+        int[] d = JpegUtil.dimensions(raw);
+        CropMath.Rect rect = null;
+        if (d[0] > 0 && d[1] > 0 && stillSize != null) {
+            rect = AutoCrop.mapToJpeg(fireCx, fireCy, fireIrisR,
+                    fireFrameW, fireFrameH,
+                    d[0], d[1], stillOrientation,
+                    stillSize.getWidth(), stillSize.getHeight());
+        }
+        if (rect == null) {
+            CropDiagnostics.Record rec = diagRecord(d, null,
+                    CropDiagnostics.Outcome.MAPPING_FAILED, null,
+                    Float.NaN, Float.NaN, Float.NaN, -1);
+            recordDiag(rec);
+            openCropScreen(raw, true, CropDiagnostics.fallbackSummary(rec));
+            return;
+        }
+        File out;
+        try {
+            File dir = new File(getCacheDir(), "capture");
+            dir.mkdirs();
+            out = new File(dir, "cropped-" + System.currentTimeMillis() + ".jpg");
+            JpegUtil.cropToFile(raw, rect, out);
+        } catch (Exception e) {
+            // Encode failed: the raw photo is intact, so the
+            // manual crop screen can still prepare it.
+            CropDiagnostics.Record rec = diagRecord(d, rect,
+                    CropDiagnostics.Outcome.ENCODE_FAILED, null,
+                    Float.NaN, Float.NaN, Float.NaN, -1);
+            recordDiag(rec);
+            openCropScreen(raw, true, CropDiagnostics.fallbackSummary(rec));
+            return;
+        }
+        // v1.4 verification: trace the iris edge from the
+        // center of the CUT crop before submitting — a wrong
+        // mapping, a stale detection, or movement after the
+        // gate fired used to sail through silently.
+        setStatus(CaptureStatus.text(CaptureStatus.Phase.VERIFYING));
+        long t0 = System.currentTimeMillis();
+        CropVerify.Verdict verdict = null;
+        try {
+            IrisFrame frame = JpegUtil.frameForVerify(out);
+            if (frame != null) {
+                verdict = CropVerify.verify(
+                        IrisDetector.traceFromCenter(frame), frame.minDim());
+            }
+        } catch (Exception ignored) {
+            verdict = null; // verification error -> fallback below
+        }
+        long verifyMs = System.currentTimeMillis() - t0;
+        if (verdict == null) {
+            CropDiagnostics.Record rec = diagRecord(d, rect,
+                    CropDiagnostics.Outcome.VERIFY_ERROR, null,
+                    Float.NaN, Float.NaN, Float.NaN, verifyMs);
+            recordDiag(rec);
+            out.delete();
+            openCropScreen(raw, true, CropDiagnostics.fallbackSummary(rec));
+            return;
+        }
+        if (!verdict.pass) {
+            CropDiagnostics.Record rec = diagRecord(d, rect,
+                    CropDiagnostics.Outcome.VERIFY_FAILED, verdict.reason,
+                    verdict.validFrac, verdict.irisFrac, verdict.spread, verifyMs);
+            recordDiag(rec);
+            out.delete();
+            openCropScreen(raw, true, CropDiagnostics.fallbackSummary(rec));
+            return;
+        }
+        CropDiagnostics.Record rec = diagRecord(d, rect,
+                CropDiagnostics.Outcome.SUBMITTED, CropVerify.Reason.OK,
+                verdict.validFrac, verdict.irisFrac, verdict.spread, verifyMs);
+        recordDiag(rec);
+        if (pendingRawFile != null) pendingRawFile.delete();
+        pendingRawFile = null;
+        final File submit = out;
+        setStatus(CaptureStatus.text(CaptureStatus.Phase.SUBMITTING));
         runOnUiThread(() -> {
-            setStatus("Photo taken — frame the iris, then confirm.");
+            Intent result = new Intent();
+            result.putExtra(EXTRA_PHOTO_PATH, submit.getAbsolutePath());
+            setResult(RESULT_OK, result);
+            finish();
+        });
+    }
+
+    /** The diagnostics record for this attempt, filled from the
+     *  camera state. Numbers only, no photo bytes. */
+    private CropDiagnostics.Record diagRecord(int[] jpegDims, CropMath.Rect rect,
+            CropDiagnostics.Outcome outcome, CropVerify.Reason reason,
+            float validFrac, float irisFrac, float spread, long verifyMs) {
+        return new CropDiagnostics.Record(
+                cameraId, cameraLabel,
+                analysisSize == null ? -1 : analysisSize.getWidth(),
+                analysisSize == null ? -1 : analysisSize.getHeight(),
+                stillSize == null ? -1 : stillSize.getWidth(),
+                stillSize == null ? -1 : stillSize.getHeight(),
+                stillOrientation,
+                fireCx, fireCy, fireIrisR, fireFrameW, fireFrameH,
+                rect == null ? -1 : rect.left,
+                rect == null ? -1 : rect.top,
+                rect == null ? -1 : rect.size,
+                jpegDims[0], jpegDims[1],
+                outcome, reason, validFrac, irisFrac, spread, verifyMs);
+    }
+
+    /** Store the last attempt (only) and refresh the camera
+     *  screen's diagnostics line. App-private prefs; the record
+     *  is never transmitted anywhere. */
+    private void recordDiag(CropDiagnostics.Record rec) {
+        getSharedPreferences(DIAG_PREFS, MODE_PRIVATE).edit()
+                .putString(DIAG_KEY, CropDiagnostics.encode(rec)).apply();
+        refreshDiagLine();
+    }
+
+    private void refreshDiagLine() {
+        String encoded = getSharedPreferences(DIAG_PREFS, MODE_PRIVATE)
+                .getString(DIAG_KEY, null);
+        final CropDiagnostics.Record rec = CropDiagnostics.decode(encoded);
+        runOnUiThread(() -> {
+            if (diagLine == null) return;
+            if (rec == null) {
+                diagLine.setVisibility(View.GONE);
+            } else {
+                diagLine.setText(CropDiagnostics.lastCheckLine(rec));
+                diagLine.setVisibility(View.VISIBLE);
+            }
+        });
+    }
+
+    /** Open the manual crop step. {@code autoFallback} marks a
+     *  photo the auto-crop could not frame, so the crop screen
+     *  says so honestly instead of looking like a normal stop;
+     *  {@code diagSummary} (may be null) is the plain-words
+     *  "Why" line shown under the status on that screen. */
+    private void openCropScreen(File raw, boolean autoFallback, String diagSummary) {
+        runOnUiThread(() -> {
+            setStatus(autoFallback
+                    ? "Auto-crop could not frame this photo — frame the iris, then confirm."
+                    : "Photo taken — frame the iris, then confirm.");
             Intent i = new Intent(this, CropActivity.class);
             i.putExtra(CropActivity.EXTRA_IMAGE_PATH, raw.getAbsolutePath());
             i.putExtra(CropActivity.EXTRA_EYE, eye);
+            i.putExtra(CropActivity.EXTRA_AUTO_FALLBACK, autoFallback);
+            if (diagSummary != null) {
+                i.putExtra(CropActivity.EXTRA_DIAGNOSTICS, diagSummary);
+            }
             startActivityForResult(i, REQ_CROP);
         });
     }
 
     private void onCaptureFailed(String message) {
         capturing = false;
+        autoFired = false;
         gate.reset(); // a failed capture must not latch auto-capture off
         runOnUiThread(() -> {
             Toast.makeText(this, message, Toast.LENGTH_LONG).show();
@@ -923,6 +1166,7 @@ public class CameraActivity extends Activity {
         gate.reset(); // a fresh stability window each time we return
         afKnown = false;
         afFocused = false;
+        refreshDiagLine(); // the last auto-crop check, if any
         if (cameraDevice == null && bgHandler == null) {
             startBackground();
             openCamera();

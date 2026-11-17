@@ -12,14 +12,42 @@ package app.eyeknow.android;
  * the crop step offers — it matches "frame the iris" and cannot
  * produce a sliver.
  *
- * Sizing follows the web capture caps (lib/capture.ts): frames
- * are drawn no bigger than 2560 on the long side, JPEG quality
- * 0.92. The native still is capped the same way so the photo the
- * reader receives is the same class of image the web flow makes.
+ * Sizing: the capture requests the largest JPEG size the
+ * camera reports, and the written crop keeps as much of that
+ * detail as the bridge allows. Two caps, kept separate on
+ * purpose:
+ *
+ * - LONG_SIDE_CAP (4096) caps the WRITTEN crop output
+ *   (JpegUtil.cropToFile): a crop larger than this is
+ *   downscaled to it; anything smaller is written at its
+ *   native crop resolution. The web reader caps its ANALYSIS
+ *   canvas at 2000px, but the stored/displayed photo is the
+ *   submitted image at full size, so a bigger crop sharpens
+ *   the photo the user sees and keeps, and slightly improves
+ *   the analysis input — without changing the analysis
+ *   resolution. The bridge carries the photo as a base64 data
+ *   URL, so the output stays in the low single-digit MB range
+ *   at quality 92.
+ * - PREVIEW_LONG_SIDE_CAP (2560) caps the DISPLAY decode
+ *   (JpegUtil.decodeCapped): the crop screen never needs
+ *   full resolution, and the preview must stay fast.
+ *
+ * Rotation: the crop screen lets the user rotate the photo
+ * 90 degrees clockwise per tap. The crop square is defined in
+ * DISPLAYED space (the rotated view); rotateRect/unrotateRect
+ * map square rects between source and displayed pixel space
+ * for 0/90/180/270. The auto path never rotates (rotation 0).
  */
 public final class CropMath {
 
-    public static final int LONG_SIDE_CAP = 2560;
+    /** Long-side cap for the WRITTEN crop output. */
+    public static final int LONG_SIDE_CAP = 4096;
+
+    /** Long-side cap for the DISPLAY decode only (the crop
+     *  screen preview). Unchanged since v1.0: the preview
+     *  must stay fast and never needs full resolution. */
+    public static final int PREVIEW_LONG_SIDE_CAP = 2560;
+
     public static final int JPEG_QUALITY = 92;
 
     /** Default crop square: this fraction of the shorter side,
@@ -122,15 +150,17 @@ public final class CropMath {
     }
 
     /**
-     * BitmapFactory inSampleSize to decode a JPEG of w x h so the
-     * decoded bitmap's long side is at most LONG_SIDE_CAP. Powers
-     * of two only (what the decoder honors). Returns 1 when the
-     * image already fits.
+     * BitmapFactory inSampleSize to decode a JPEG of w x h for
+     * DISPLAY so the decoded bitmap's long side is at most
+     * PREVIEW_LONG_SIDE_CAP. Powers of two only (what the
+     * decoder honors). Returns 1 when the image already fits.
+     * The written crop never uses this path — it region-decodes
+     * at full resolution (JpegUtil.cropToFile).
      */
     public static int sampleSize(int w, int h) {
         int longSide = Math.max(w, h);
         int sample = 1;
-        while (longSide / sample > LONG_SIDE_CAP) sample *= 2;
+        while (longSide / sample > PREVIEW_LONG_SIDE_CAP) sample *= 2;
         return sample;
     }
 
@@ -142,5 +172,97 @@ public final class CropMath {
         float s = (float) LONG_SIDE_CAP / longSide;
         return new int[] { Math.max(1, Math.round(w * s)),
                            Math.max(1, Math.round(h * s)) };
+    }
+
+    // ------------------------------------------------------- rotation
+
+    /** Normalize a rotation to 0/90/180/270. Anything else is
+     *  treated as 0 — the crop screen only ever produces
+     *  multiples of 90, and a bogus value must never rotate. */
+    public static int normalizeRotation(int degrees) {
+        int d = ((degrees % 360) + 360) % 360;
+        return (d == 90 || d == 180 || d == 270) ? d : 0;
+    }
+
+    /** Dimensions {w, h} of an image of w x h rotated CLOCKWISE
+     *  by degrees (0/90/180/270). 90/270 swap the axes. */
+    public static int[] rotatedDims(int w, int h, int degrees) {
+        int d = normalizeRotation(degrees);
+        return (d == 90 || d == 270) ? new int[] { h, w } : new int[] { w, h };
+    }
+
+    /**
+     * Map a square rect from SOURCE pixel space to DISPLAYED
+     * space, where the displayed image is the source rotated
+     * CLOCKWISE by degrees. The mapping is exact integer
+     * arithmetic on the rect's edges: a source pixel (x, y) in
+     * a W x H image lands at displayed (H-1-y, x) for 90, at
+     * (W-1-x, H-1-y) for 180, and at (y, W-1-x) for 270. The
+     * result is clamped inside the displayed dimensions (a
+     * no-op for an in-bounds source rect, a safety net for a
+     * rounded one). The size is preserved exactly — unlike
+     * clamp(), no minimum is enforced here, because the rect
+     * was already minimum-clamped in its own space and the
+     * rotation must not grow it.
+     */
+    public static Rect rotateRect(Rect src, int srcW, int srcH, int degrees) {
+        int d = normalizeRotation(degrees);
+        int[] dims = rotatedDims(srcW, srcH, d);
+        Rect r;
+        switch (d) {
+            case 90:
+                r = new Rect(srcH - src.top - src.size, src.left, src.size);
+                break;
+            case 180:
+                r = new Rect(srcW - src.left - src.size, srcH - src.top - src.size, src.size);
+                break;
+            case 270:
+                r = new Rect(src.top, srcW - src.left - src.size, src.size);
+                break;
+            default:
+                r = src;
+                break;
+        }
+        return clampPosition(r, dims[0], dims[1]);
+    }
+
+    /**
+     * Inverse of rotateRect: map a square rect from DISPLAYED
+     * space back to SOURCE pixel space. The crop screen draws
+     * the square in displayed space; confirm maps it back
+     * through here, crops the source, and rotates the cropped
+     * square by the same rotation — so the written JPEG is
+     * exactly what the preview showed inside the square. The
+     * size is preserved exactly (see rotateRect).
+     */
+    public static Rect unrotateRect(Rect disp, int srcW, int srcH, int degrees) {
+        int d = normalizeRotation(degrees);
+        Rect r;
+        switch (d) {
+            case 90:
+                r = new Rect(disp.top, srcH - disp.left - disp.size, disp.size);
+                break;
+            case 180:
+                r = new Rect(srcW - disp.left - disp.size, srcH - disp.top - disp.size, disp.size);
+                break;
+            case 270:
+                r = new Rect(srcW - disp.top - disp.size, disp.left, disp.size);
+                break;
+            default:
+                r = disp;
+                break;
+        }
+        return clampPosition(r, srcW, srcH);
+    }
+
+    /** Clamp a square rect's POSITION inside the image, keeping
+     *  its size (capped at the short side). Unlike clamp(), no
+     *  minimum size is enforced: rotation mapping must never
+     *  grow a rect. */
+    private static Rect clampPosition(Rect r, int w, int h) {
+        int size = Math.max(1, Math.min(Math.min(w, h), r.size));
+        int left = Math.max(0, Math.min(w - size, r.left));
+        int top = Math.max(0, Math.min(h - size, r.top));
+        return new Rect(left, top, size);
     }
 }

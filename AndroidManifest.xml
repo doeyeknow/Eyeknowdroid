@@ -21,10 +21,23 @@
         <activity
             android:name=".MainActivity"
             android:exported="true"
+            android:launchMode="singleTask"
             android:configChanges="orientation|screenSize|keyboardHidden">
             <intent-filter>
                 <action android:name="android.intent.action.MAIN" />
                 <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+            <!-- Deep links (v1.4): eyeknow.app links open in the
+                 app so referral codes land in the WebView's own
+                 storage. autoVerify makes taps open straight in
+                 the app once the assetlinks file is live; until
+                 then the system shows an app chooser. -->
+            <intent-filter android:autoVerify="true">
+                <action android:name="android.intent.action.VIEW" />
+                <category android:name="android.intent.category.DEFAULT" />
+                <category android:name="android.intent.category.BROWSABLE" />
+                <data android:scheme="https" android:host="eyeknow.app" />
+                <data android:scheme="https" android:host="www.eyeknow.app" />
             </intent-filter>
         </activity>
         <activity

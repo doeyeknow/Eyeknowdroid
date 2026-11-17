@@ -30,6 +30,45 @@ and must never be committed — this repo is public.
 
 ## Status
 
+v1.5 (2026-11-16): stamped APK download. An APK downloaded
+through a referral link carries the code stamped into its
+signing block; the app reads it on its first plain launch and
+loads the home page with ?ref= once, so checkout credits the
+affiliate. Once ever, deep links win, updates never re-stamp.
+
+v1.4 (2026-11-16): auto-crop verification + capture sequencing
+fix + diagnostics + deep links. The gate firing no longer says
+"Captured." — the status holds "Hold still — capturing…"
+until the still is saved. Every auto-crop is re-checked before
+it submits (the iris edge is traced from the center of the cut
+crop); a badly framed crop falls back to the manual crop
+screen with the raw photo intact and a plain-words reason,
+and the last attempt's numbers show on the camera screen.
+Affiliate/referral links now open in the app, query intact,
+so the referral lands in the app's own storage. On-device
+proof (hold-still sequencing, good crops still submitting,
+bad framing falling back with a readable reason, referral
+price showing in-app) is still Adam's Galaxy A16.
+
+v1.3 (2026-11-16): rotate after capture + higher-resolution
+crops. The crop screen has a Rotate button (90° clockwise per
+tap, four taps back to the original); the confirmed photo
+matches the preview orientation exactly. Crop output is now
+region-decoded at full source resolution and capped at 4096
+on the long side instead of 2560 (capture already requested
+the camera's largest JPEG size — the crop was the limiter).
+The auto path is unchanged apart from the resolution. On-device
+proof (rotation direction, sharper submitted photo, no OOM on
+a full-res capture) is still Adam's Galaxy A16.
+
+v1.2 (2026-11-15): auto-crop + auto-submit. A gate-fired still is
+cropped to the detected iris bounds and submitted straight into
+the reading flow — no crop screen on the auto path. Also fixes a
+v1.1 bug: the analysis stream was never targeted by the repeating
+request, so the gate could never fire. Manual capture and its crop
+step are unchanged. On-device proof (gate firing, crop framing,
+submit landing) is still Adam's Galaxy A16.
+
 v1.1 (2026-11-15): auto-capture. The camera fires the still itself
 when the web reader's own decision logic — ported to pure Java —
 sees an iris in focus and steady for ~0.8 s. Manual capture always

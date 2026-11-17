@@ -3,6 +3,7 @@ package app.eyeknow.android;
 import android.Manifest;
 import android.app.Activity;
 import android.content.Intent;
+import android.content.SharedPreferences;
 import android.content.pm.PackageManager;
 import android.graphics.Color;
 import android.net.Uri;
@@ -37,6 +38,29 @@ import java.io.File;
  * opens in the browser. The bridge shim is injected on every
  * page finish, so it is present whenever the site checks for it.
  *
+ * Deep links (v1.4): an eyeknow.app link tapped anywhere opens
+ * in the app (manifest intent-filter, autoVerify), and the
+ * FULL link URL loads — query string intact — so a referral
+ * code (?ref=) is captured in the WebView's own storage instead
+ * of the browser's cookie jar, where the app could never see
+ * it. The launch intent and links arriving while the app runs
+ * both go through the same trust rule; anything untrusted
+ * loads the home page instead. singleTask launch mode keeps
+ * exactly one MainActivity: a link tap while the app runs
+ * delivers onNewIntent to the existing instance.
+ *
+ * Stamped download (v1.5): an APK downloaded through a
+ * referral link carries the code stamped into its signing
+ * block (see ApkStamp). On the first PLAIN launch — no
+ * trusted deep link — the shell reads its own APK file once
+ * and, when a valid stamp is present, loads the home page
+ * with ?ref= added, so the page captures the referral exactly
+ * as if the link had opened in the app. The check runs at
+ * most once ever (a persisted flag, set even when no stamp
+ * is found): reinstalls start fresh, updates never re-stamp,
+ * and a deep link always wins over the stamp. Any failure
+ * reading the stamp falls back to the plain home page.
+ *
  * The upload fallback and the web camera keep working inside the
  * shell: file inputs get a chooser, and getUserMedia permission
  * requests are granted once the runtime camera permission holds.
@@ -51,6 +75,10 @@ public class MainActivity extends Activity implements CaptureBridge.Host {
     private static final int REQ_CAPTURE = 4101;
     private static final int REQ_FILE_CHOOSER = 4102;
     private static final int REQ_CAMERA_PERMISSION = 4103;
+
+    /** Shell prefs: the once-ever referral-stamp check (v1.5). */
+    private static final String SHELL_PREFS = "eyeknow_shell";
+    private static final String KEY_STAMP_CHECKED = "ref_stamp_checked";
 
     private WebView webView;
     private LinearLayout errorPanel;
@@ -78,6 +106,15 @@ public class MainActivity extends Activity implements CaptureBridge.Host {
         s.setMixedContentMode(WebSettings.MIXED_CONTENT_NEVER_ALLOW);
         s.setSupportMultipleWindows(false);
         s.setMediaPlaybackRequiresUserGesture(false);
+        // v1.6: honor the site's viewport meta (width=device-width,
+        // initial-scale=1) and fit the page to the screen width.
+        // Without these two, the WebView ignores the viewport tag,
+        // lays the page out at the default wide width, and shows it
+        // with no shrink-to-fit — the page looks zoomed in. The
+        // site sets user-scalable=false itself, so pinch-zoom stays
+        // off, matching Chrome and Adam's 2026-11-05 no-zoom call.
+        s.setUseWideViewPort(true);
+        s.setLoadWithOverviewMode(true);
         CookieManager.getInstance().setAcceptCookie(true);
 
         bridge = new CaptureBridge(webView, this);
@@ -154,7 +191,60 @@ public class MainActivity extends Activity implements CaptureBridge.Host {
             }
         });
 
-        webView.loadUrl(HOME_URL);
+        // A deep link (affiliate ?ref= link, shared reading, ...)
+        // loads in full, query intact; a plain launch, or an
+        // untrusted intent URL, loads the home page — with the
+        // stamped referral attached on the first plain launch
+        // when this APK was downloaded through a referral link.
+        webView.loadUrl(launchUrlFor(getIntent()));
+    }
+
+    @Override
+    protected void onNewIntent(Intent intent) {
+        super.onNewIntent(intent);
+        setIntent(intent);
+        // Only navigate when the intent actually carries a link:
+        // a plain launcher re-tap (no data) must leave the
+        // current page alone. A link arriving while the app runs
+        // loads exactly as it would on a cold start.
+        if (intent != null && intent.getDataString() != null && webView != null) {
+            // Links arriving mid-session never consult the
+            // stamp: the stamp belongs to the first launch.
+            webView.loadUrl(TrustedSite.startUrl(intent.getDataString(), HOME_URL));
+        }
+    }
+
+    /** The URL to load at launch for an incoming intent: the
+     *  full link URL verbatim when trusted; HOME_URL
+     *  otherwise — with the stamped referral attached on the
+     *  first plain launch when this APK carries a valid stamp. */
+    private String launchUrlFor(Intent intent) {
+        String data = intent == null ? null : intent.getDataString();
+        String start = TrustedSite.startUrl(data, HOME_URL);
+        if (!HOME_URL.equals(start)) return start;
+        return applyStampIfFirstLaunch();
+    }
+
+    /**
+     * The referral stamp, consulted at most once ever: on the
+     * first plain launch, read this APK's signing block and
+     * attach a valid stamp as ?ref=. The checked flag is set
+     * before reading, so the check never runs twice — even
+     * when no stamp is found or the read fails. A deep link
+     * never reaches this method, so a tapped link always wins
+     * over the stamp, and the flag is left unset for a later
+     * plain launch. Never throws: any failure yields HOME_URL.
+     */
+    private String applyStampIfFirstLaunch() {
+        try {
+            SharedPreferences prefs = getSharedPreferences(SHELL_PREFS, MODE_PRIVATE);
+            if (prefs.getBoolean(KEY_STAMP_CHECKED, false)) return HOME_URL;
+            prefs.edit().putBoolean(KEY_STAMP_CHECKED, true).apply();
+            String code = ApkStamp.readStampFromFile(getPackageCodePath());
+            return ApkStamp.stampedHomeUrl(HOME_URL, code);
+        } catch (Exception e) {
+            return HOME_URL;
+        }
     }
 
     private LinearLayout buildErrorPanel() {
@@ -182,10 +272,9 @@ public class MainActivity extends Activity implements CaptureBridge.Host {
     }
 
     private boolean isTrustedSite(Uri uri) {
-        if (!"https".equals(uri.getScheme())) return false;
-        String host = uri.getHost();
-        if (!"eyeknow.app".equals(host) && !"www.eyeknow.app".equals(host)) return false;
-        return uri.getPort() == -1 || uri.getPort() == 443;
+        // Same rule as the deep-link entry point, factored into
+        // TrustedSite so the two can never drift apart.
+        return TrustedSite.isTrusted(uri.getScheme(), uri.getHost(), uri.getPort());
     }
 
     private void openExternalLink(Uri uri) {

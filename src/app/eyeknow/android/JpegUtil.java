@@ -2,7 +2,9 @@ package app.eyeknow.android;
 
 import android.graphics.Bitmap;
 import android.graphics.BitmapFactory;
+import android.graphics.BitmapRegionDecoder;
 import android.graphics.Matrix;
+import android.graphics.Rect;
 import android.util.Base64;
 
 import java.io.ByteArrayOutputStream;
@@ -16,13 +18,18 @@ import java.io.IOException;
  * drives BitmapFactory/Bitmap.
  *
  * Memory safety: phone stills can be 50MP+. Decoding one at full
- * size would OOM the app, so every decode subsamples to the
- * 2560 long-side cap FIRST (CropMath.sampleSize), and the crop
- * rect is scaled into the subsampled space before cropping.
+ * size would OOM the app, so the crop path REGION-decodes only
+ * the crop rect (BitmapRegionDecoder) at full source
+ * resolution — the full frame is never inflated. The preview
+ * decode (decodeCapped) subsamples to the 2560 preview cap
+ * instead: display never needs full resolution.
  *
  * Rotation: the capture request sets JPEG_ORIENTATION so the
  * stored JPEG is upright; the crop math therefore works in the
- * JPEG's own pixel space with no extra rotation step.
+ * JPEG's own pixel space. The crop screen's user rotation is
+ * applied to the CROPPED square only, inside cropToFile, so the
+ * written JPEG is encoded exactly once, in the orientation the
+ * preview showed. The auto path always passes rotation 0.
  */
 public final class JpegUtil {
 
@@ -37,7 +44,8 @@ public final class JpegUtil {
     }
 
     /** Decode a JPEG subsampled so its long side is at most the
-     *  cap. Returns null when the file is not a readable image. */
+     *  preview cap. Returns null when the file is not a readable
+     *  image. Display only — never used for the written crop. */
     public static Bitmap decodeCapped(File file) {
         int[] d = dimensions(file);
         if (d[0] <= 0 || d[1] <= 0) return null;
@@ -50,44 +58,89 @@ public final class JpegUtil {
     /**
      * Crop a JPEG file to a square rect given in the JPEG's FULL
      * pixel space, writing a fresh JPEG (quality 92, long side
-     * capped at 2560). The decode is subsampled and the rect is
-     * scaled down to match, so a 50MP still never inflates.
-     * Returns the output file. Throws on unreadable input.
+     * capped at 4096). No rotation — the auto path's entry
+     * point. See the four-argument overload for the full
+     * contract.
      */
     public static File cropToFile(File input, CropMath.Rect fullRect, File output)
             throws IOException {
+        return cropToFile(input, fullRect, output, 0);
+    }
+
+    /**
+     * Crop a JPEG file to a square rect given in the JPEG's FULL
+     * pixel space, rotate the cropped square clockwise by
+     * {@code rotationDegrees} (0/90/180/270; anything else is
+     * treated as 0), and write a fresh JPEG (quality 92, long
+     * side capped at 4096 — downscaled only when the crop
+     * exceeds the cap, otherwise written at native crop
+     * resolution).
+     *
+     * The decode is a REGION decode: only the crop rect is
+     * decoded, at full source resolution, so a 50MP still
+     * never inflates into a full bitmap and no detail is lost
+     * to subsampling. At most three bitmaps exist at once
+     * (region, rotated copy, optional downscale), all recycled.
+     * Returns the output file. Throws on unreadable input.
+     */
+    public static File cropToFile(File input, CropMath.Rect fullRect, File output,
+                                  int rotationDegrees) throws IOException {
         int[] d = dimensions(input);
         if (d[0] <= 0 || d[1] <= 0) {
             throw new IOException("Captured photo could not be read.");
         }
-        int sample = CropMath.sampleSize(d[0], d[1]);
-        BitmapFactory.Options o = new BitmapFactory.Options();
-        o.inSampleSize = sample;
-        o.inPreferredConfig = Bitmap.Config.ARGB_8888;
-        Bitmap bmp = BitmapFactory.decodeFile(input.getAbsolutePath(), o);
-        if (bmp == null) throw new IOException("Captured photo could not be decoded.");
+        CropMath.Rect r = CropMath.clamp(fullRect, d[0], d[1]);
+        BitmapRegionDecoder decoder =
+                BitmapRegionDecoder.newInstance(input.getAbsolutePath(), false);
+        if (decoder == null) {
+            throw new IOException("Captured photo could not be decoded.");
+        }
         try {
-            CropMath.Rect r = CropMath.clamp(
-                    new CropMath.Rect(fullRect.left / sample, fullRect.top / sample,
-                            fullRect.size / sample),
-                    bmp.getWidth(), bmp.getHeight());
-            Bitmap cropped = Bitmap.createBitmap(bmp, r.left, r.top, r.size, r.size);
+            BitmapFactory.Options o = new BitmapFactory.Options();
+            o.inPreferredConfig = Bitmap.Config.ARGB_8888;
+            Bitmap cropped = decoder.decodeRegion(
+                    new Rect(r.left, r.top, r.left + r.size, r.top + r.size), o);
+            if (cropped == null) {
+                throw new IOException("Captured photo could not be decoded.");
+            }
             try {
-                int[] capped = CropMath.cappedSize(cropped.getWidth(), cropped.getHeight());
-                Bitmap out = cropped;
-                if (capped[0] != cropped.getWidth() || capped[1] != cropped.getHeight()) {
-                    out = Bitmap.createScaledBitmap(cropped, capped[0], capped[1], true);
+                // The region decoder returns the requested rect;
+                // trim defensively if a decoder ever returns
+                // more (the square invariant must hold).
+                Bitmap exact = cropped;
+                if (cropped.getWidth() > r.size || cropped.getHeight() > r.size) {
+                    exact = Bitmap.createBitmap(cropped, 0, 0,
+                            Math.min(cropped.getWidth(), r.size),
+                            Math.min(cropped.getHeight(), r.size));
                 }
                 try {
-                    writeJpeg(out, output);
+                    Bitmap oriented = rotate(exact,
+                            CropMath.normalizeRotation(rotationDegrees));
+                    try {
+                        int[] capped = CropMath.cappedSize(
+                                oriented.getWidth(), oriented.getHeight());
+                        Bitmap out = oriented;
+                        if (capped[0] != oriented.getWidth()
+                                || capped[1] != oriented.getHeight()) {
+                            out = Bitmap.createScaledBitmap(
+                                    oriented, capped[0], capped[1], true);
+                        }
+                        try {
+                            writeJpeg(out, output);
+                        } finally {
+                            if (out != oriented) out.recycle();
+                        }
+                    } finally {
+                        if (oriented != exact) oriented.recycle();
+                    }
                 } finally {
-                    if (out != cropped) out.recycle();
+                    if (exact != cropped) exact.recycle();
                 }
             } finally {
                 cropped.recycle();
             }
         } finally {
-            bmp.recycle();
+            decoder.recycle();
         }
         return output;
     }
@@ -117,6 +170,48 @@ public final class JpegUtil {
         Matrix m = new Matrix();
         m.postRotate(d);
         return Bitmap.createBitmap(bmp, 0, 0, bmp.getWidth(), bmp.getHeight(), m, true);
+    }
+
+    /**
+     * Decode a cut crop into a detection frame for post-crop
+     * verification (v1.4). Subsamples to at most 512 on the
+     * long side, then converts through RgbFrame, which
+     * downsamples to the detector's 320-wide working frame
+     * with the same gray/saturation math the YUV path uses —
+     * one detection standard, not two. Returns null when the
+     * file is not a readable image; the caller treats that as
+     * a verification error and falls back. The bitmap is
+     * recycled before returning, so no large bitmap survives
+     * this call.
+     */
+    public static IrisFrame frameForVerify(File jpegFile) {
+        int[] d = dimensions(jpegFile);
+        if (d[0] <= 0 || d[1] <= 0) return null;
+        BitmapFactory.Options o = new BitmapFactory.Options();
+        o.inSampleSize = verifySampleSize(d[0], d[1]);
+        o.inPreferredConfig = Bitmap.Config.ARGB_8888;
+        Bitmap bmp = BitmapFactory.decodeFile(jpegFile.getAbsolutePath(), o);
+        if (bmp == null) return null;
+        try {
+            int w = bmp.getWidth();
+            int h = bmp.getHeight();
+            int[] pixels = new int[w * h];
+            bmp.getPixels(pixels, 0, w, 0, 0, w, h);
+            return RgbFrame.fromArgb(pixels, w, h);
+        } finally {
+            bmp.recycle();
+        }
+    }
+
+    /** Largest power-of-two sample size keeping the long side
+     *  at or below 512. Android-only (Bitmap decode), so the
+     *  harness cannot exercise it; the conversion it feeds
+     *  (RgbFrame) is harness-proven, and the decode itself is
+     *  the same subsample pattern as decodeCapped. */
+    private static int verifySampleSize(int w, int h) {
+        int s = 1;
+        while (Math.max(w, h) / s > 512) s *= 2;
+        return s;
     }
 
     /** A JPEG file as the data URL the bridge contract requires. */
