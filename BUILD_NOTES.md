@@ -13,13 +13,14 @@ on Adam's say-so — source + scripts + docs only, never signing material.
   The starter was never compiled, so there is no installed base to
   conflict with, but the appId is his and stays.
 - minSdk 26 / targetSdk 34 / compileSdk 34 (matches the starter).
-- Version 1.5 / versionCode 6 (stamped APK download; v1.4 was
-  code 5, v1.3 code 4, v1.2 code 3, v1.1 code 2, v1.0 code 1).
+- Version 1.7 / versionCode 8 (0.7 view scale; v1.6 was
+  code 7, v1.5 code 6, v1.4 code 5, v1.3 code 4, v1.2 code 3,
+  v1.1 code 2, v1.0 code 1).
 - Signing: `eyeknow-release.keystore` (alias `eyeknow`, RSA 2048),
   credentials in `keystore-credentials.txt` (0600). NEVER commit the
   keystore, the credentials file, build outputs, or the APK — the
   repo is public. Every future update signs with this key.
-- Certificate SHA-256 (v1.0, v1.1, v1.2, same key): f81636efe59d728bee505f323fd34e428bead2bdaac1f290b1ff6721a65f674b
+- Certificate SHA-256 (v1.0–v1.7, same key): f81636efe59d728bee505f323fd34e428bead2bdaac1f290b1ff6721a65f674b
 
 ## Build (no Gradle — impossible in the build VM)
 
@@ -543,6 +544,90 @@ v1.0–v1.5; badging confirms versionCode 7, versionName 1.6,
 the same 3 permissions; both settings calls present in the
 dex. Harness 497/497.
 
+## View scale 0.7 (v1.7, Adam's order 2026-11-17)
+
+Adam (12:49, on 1.6, confirmed installed): "Set the view to
+0.7." The v1.6 viewport fix was verified correct in code and
+a headless measurement at 360px CSS width showed the site
+fitting exactly (scrollWidth 360, scale 1) — no overflow, no
+wide element — yet the page still looked "way zoomed in" on
+his phone, on the homepage and in readings. The order is
+taken as stated: render everything at 0.7, using the full
+screen with smaller content.
+
+Mechanism (chosen deliberately): the existing shim-injection
+path — the JS evaluated on every page finish that installs
+window.EyeknowCapture — now also runs
+`document.documentElement.style.zoom = '0.7'`, in the same
+script, after the shim install. Root-element zoom resizes
+the initial containing block, so content reflows to the
+wider effective width and fills the screen at 70%. The
+script is built by BridgeMessages.injectionScript (pure
+Java, the single source of truth, harness-pinned) and
+CaptureBridge evaluates it verbatim; the shim install
+itself is byte-identical to v1.0–v1.6. The v1.6 viewport
+settings are untouched. Re-injection is idempotent (same
+shim, same zoom value), so full navigations re-apply it and
+same-document (SPA) navigations keep it, since the
+documentElement style survives them.
+
+Rejected alternatives, and why:
+- Body zoom (`document.body.style.zoom`): the layout
+  viewport stays full-size, so content shrinks into the
+  top-left and leaves empty space — not the full-screen
+  smaller view Adam ordered.
+- setInitialScale: the page's viewport meta (initial-scale=1)
+  wins over it, and compounding a native scale with the zoom
+  would double-scale.
+- setScaleX/setScaleY: a view-level transform leaves
+  margins and breaks touch coordinates (taps would land
+  off the control touched).
+- Rewriting the viewport meta: re-evaluation after load is
+  unreliable across navigations.
+- setTextZoom: text only; layout and images stay large.
+
+First-paint flash: the injection runs on page finish, so a
+brief flash at full size before the zoom applies on first
+paint is possible and is accepted. No reliable pre-paint
+hook exists without an HTML rewrite: onPageStarted runs
+before the DOM exists (the statement would need retry
+polling), and onPageCommitVisible fires at/after the first
+committed paint. Intercepting the HTML to inject a <style>
+into <head> WOULD avoid the flash, but that is an HTML
+rewrite and was deliberately not built. If the flash
+bothers Adam on-device, the HTML-intercept route is the
+known next step — it needs his say-so, not a silent build.
+
+Verified: APK v1.7, 66,035 bytes, sha256
+4113b227c0ceb9cda48ccd7029908195d7e64bac54a3b0c4d31d5fb8b9a5de0a
+(same byte count as v1.6 by zip coincidence; the sha
+differs and the dex contains the zoom statement);
+apksigner v2+v3, 1 signer, cert fingerprint matches
+v1.0–v1.6; badging confirms versionCode 8, versionName 1.7,
+the same 3 permissions; the dex contains the exact
+injected string (shim + zoom), injectionScript, and both
+v1.6 viewport settings calls, and contains NO
+setInitialScale / setTextZoom / setScaleX / setScaleY /
+body-zoom string; zipalign clean. Harness 508/508 (497
+prior + 11 new: exact injected script, shim install
+present in the same injection, zoom after shim, one zoom
+assignment, no body zoom, idempotent re-injection,
+delivery target unchanged).
+
+On-device checklist: (1) the homepage renders visibly
+smaller, with more content on screen and nothing cut off;
+(2) a reading renders the same way — illustration, tabs,
+body map all smaller and complete; (3) taps land on the
+control touched (bottom bar, tabs, buttons, links); (4)
+capture still opens from the page and submits through the
+bridge unchanged; (5) the zoom survives in-app navigation
+(full loads and in-page moves alike); (6) note whether a
+full-size flash appears before the zoom on first paint,
+and whether it bothers — that decides the HTML-intercept
+question. Deep links, the stamp reader, camera, crop, and
+rotation are untouched by this change; no re-verification
+beyond the capture check above is required for them.
+
 ## Crop (CropActivity + CropOverlayView)
 
 Square crop only: drag to move, drag a corner to resize, slider
@@ -563,7 +648,7 @@ silent drop.
 
 ## Verification
 
-- Harness: harness/Harness.java, 452/452 checks on the exact
+- Harness: harness/Harness.java, 508/508 checks on the exact
   shipping pure-Java classes (bridge parse/build, camera
   selection incl. the macro honesty rule, crop math incl.
   view<->image round-trip, focus/zoom math, YUV conversion
@@ -582,7 +667,11 @@ silent drop.
   CropDiagnostics record (round-trip, separator safety,
   garbage handling, wording), and the TrustedSite rule +
   URL selection (verbatim referral passthrough, all
-  rejection cases -> home).
+  rejection cases -> home), plus 11 v1.7 checks (exact
+  injected script: shim install + root zoom 0.7 in one
+  string, shim before zoom, one zoom assignment, no body
+  zoom, byte-identical re-injection, delivery target
+  unchanged).
   Run: javac -encoding UTF-8 the fourteen pure sources +
   Harness.java, java Harness, from harness/ (the fixture
   leg loads fixtures/adam-autocrop-20261116.jpg).
@@ -669,8 +758,8 @@ silent drop.
     res/drawable/ic_launcher.png
     src/app/eyeknow/android/
       MainActivity.java       WebView shell + bridge host + chooser
-      CaptureBridge.java      JS shim + @JavascriptInterface + delivery
-      BridgeMessages.java     wire format (pure)
+      CaptureBridge.java      JS shim + view zoom + @JavascriptInterface + delivery
+      BridgeMessages.java     wire format + injection script (pure)
       CaptureSession.java     one-in-flight guard + cancel
       CameraActivity.java     Camera2 camera + auto-capture wiring
       CameraChoice.java       lens selection + honesty label (pure)

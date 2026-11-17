@@ -170,4 +170,31 @@ public final class BridgeMessages {
         return "window.EyeknowCapture && window.EyeknowCapture.onmessage"
                 + " && window.EyeknowCapture.onmessage({data:" + quote(replyJson) + "});";
     }
+
+    /** View scale (v1.7, Adam's order 2026-11-17: "Set the view to
+     *  0.7"). Applied as a CSS zoom on the ROOT element, so the
+     *  initial containing block resizes: content reflows to the
+     *  wider effective width and fills the screen at 70%, instead
+     *  of shrinking inside a full-size viewport. */
+    public static final String VIEW_ZOOM = "0.7";
+
+    /** The script injected on every page finish: installs the
+     *  window.EyeknowCapture shim (unchanged contract — the
+     *  postMessage forward and the null onmessage the site
+     *  owns) and then applies the root-element zoom. One
+     *  script, one evaluateJavascript call: the shim install
+     *  comes first so the bridge never depends on the zoom,
+     *  and re-injection is idempotent (same shim, same zoom
+     *  value) on every navigation. Pure Java so the harness
+     *  pins the exact shipping string; CaptureBridge is the
+     *  only caller and evaluates exactly what this returns.
+     *  @param nativeName the @JavascriptInterface object name
+     *         the shim forwards postMessage into. */
+    public static String injectionScript(String nativeName) {
+        return "window.EyeknowCapture = {"
+                + "postMessage: function(m) { window." + nativeName + ".postMessage(m); },"
+                + "onmessage: null"
+                + "};"
+                + "document.documentElement.style.zoom = '" + VIEW_ZOOM + "';";
+    }
 }

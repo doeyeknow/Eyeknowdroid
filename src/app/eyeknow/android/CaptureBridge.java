@@ -26,6 +26,13 @@ import java.lang.ref.WeakReference;
  * injected into the trusted site: MainActivity locks navigation
  * to eyeknow.app / www.eyeknow.app and opens everything else in
  * the browser.
+ *
+ * View scale (v1.7): the same injection also sets the root
+ * element's CSS zoom to 0.7 (Adam's order), so the page renders
+ * smaller and fills the screen. The script is built by
+ * BridgeMessages.injectionScript — pure Java, harness-pinned —
+ * and evaluated verbatim here; see there for the mechanism and
+ * the rejected alternatives.
  */
 public final class CaptureBridge {
 
@@ -33,12 +40,11 @@ public final class CaptureBridge {
      *  "EyeknowCapture" — that name belongs to the shim. */
     public static final String NATIVE_NAME = "EyeknowNative";
 
-    /** The shim source. Kept dependency-free and idempotent. */
-    public static final String SHIM =
-            "window.EyeknowCapture = {"
-            + "postMessage: function(m) { window." + NATIVE_NAME + ".postMessage(m); },"
-            + "onmessage: null"
-            + "};";
+    /** The script injected on every page finish: the shim install
+     *  plus the root-element zoom. Built by BridgeMessages (the
+     *  single source of truth, pinned by the harness) and kept
+     *  dependency-free and idempotent. */
+    public static final String INJECTION = BridgeMessages.injectionScript(NATIVE_NAME);
 
     public interface Host {
         /** The site asked for a capture. Runs on a WebView thread —
@@ -57,13 +63,13 @@ public final class CaptureBridge {
         this.host = host;
     }
 
-    /** Inject (or re-inject) the shim. Safe to call repeatedly. */
+    /** Inject (or re-inject) the shim + view scale. Safe to call repeatedly. */
     public void injectShim() {
         WebView w = webViewRef.get();
         if (w == null) return;
         mainHandler.post(() -> {
             WebView v = webViewRef.get();
-            if (v != null) v.evaluateJavascript(SHIM, null);
+            if (v != null) v.evaluateJavascript(INJECTION, null);
         });
     }
 

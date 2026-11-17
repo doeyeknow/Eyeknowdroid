@@ -65,6 +65,7 @@ public class Harness {
 
     public static void main(String[] args) {
         bridge();
+        viewZoom();
         cameraChoice();
         cropMath();
         focusMath();
@@ -143,6 +144,40 @@ public class Harness {
                 "bridge: delivery script quotes reply as string: " + script);
         // Quote: control chars + unicode-safe.
         eq("\"a\\u0001b\"", BridgeMessages.quote("a\u0001b"), "bridge: quote control char");
+    }
+
+    private static void viewZoom() {
+        // v1.7: the injected script is the shim install + the
+        // root-element zoom in ONE string, built by
+        // BridgeMessages and evaluated verbatim by CaptureBridge.
+        String script = BridgeMessages.injectionScript("EyeknowNative");
+        eq("0.7", BridgeMessages.VIEW_ZOOM, "zoom: VIEW_ZOOM is 0.7");
+        check(script.contains("document.documentElement.style.zoom = '0.7'"),
+                "zoom: injected script sets documentElement zoom 0.7: " + script);
+        check(script.contains("window.EyeknowCapture = {"),
+                "zoom: shim install present in the same injection");
+        check(script.contains("postMessage: function(m) { window.EyeknowNative.postMessage(m); }"),
+                "zoom: shim postMessage forward unchanged");
+        check(script.contains("onmessage: null"),
+                "zoom: shim onmessage null (site-owned) unchanged");
+        check(script.indexOf("window.EyeknowCapture = {")
+                        < script.indexOf("document.documentElement.style.zoom"),
+                "zoom: shim installs before the zoom statement");
+        eq("window.EyeknowCapture = {"
+                        + "postMessage: function(m) { window.EyeknowNative.postMessage(m); },"
+                        + "onmessage: null"
+                        + "};"
+                        + "document.documentElement.style.zoom = '0.7';",
+                script, "zoom: exact injected script");
+        check(script.indexOf("style.zoom") == script.lastIndexOf("style.zoom"),
+                "zoom: exactly one zoom assignment");
+        check(!script.contains("document.body"),
+                "zoom: no body zoom (root element only)");
+        eq(BridgeMessages.injectionScript("EyeknowNative"), script,
+                "zoom: re-injection is byte-identical (idempotent)");
+        check(BridgeMessages.deliveryScript("{\"a\":1}").contains("window.EyeknowCapture.onmessage")
+                        && script.contains("window.EyeknowCapture"),
+                "zoom: delivery target is the object the injection installs");
     }
 
     private static CameraChoice.Lens lens(String id, boolean back, float diopters) {
