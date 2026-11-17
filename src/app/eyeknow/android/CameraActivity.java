@@ -25,6 +25,7 @@ import android.media.ImageReader;
 import android.os.Bundle;
 import android.os.Handler;
 import android.os.HandlerThread;
+import android.os.SystemClock;
 import android.util.Size;
 import android.view.GestureDetector;
 import android.view.Gravity;
@@ -57,6 +58,13 @@ import java.util.List;
  *   matching the web flow's "rear camera: torch on"), toggleable.
  * - Continuous autofocus + tap-to-focus on the eye region.
  * - Pinch + slider zoom into the iris, level shown.
+ * - Auto-capture (v1.1): preview frames are analyzed on a
+ *   background thread (throttled, downscaled) with the web
+ *   reader's own decision logic — iris present, well-framed, in
+ *   focus, and steady — and the still fires itself. The manual
+ *   shutter button always stays available, and auto-capture can
+ *   be toggled off; it never captures a frame the detector
+ *   rejected.
  * - A still capture goes to the crop step; the cropped photo
  *   returns to MainActivity as a file path (never a Binder extra
  *   — a JPEG data URL would blow the transaction limit).
@@ -83,9 +91,21 @@ public class CameraActivity extends Activity {
     private SeekBar zoomSlider;
     private Button torchButton;
     private Button captureButton;
+    private Button autoButton;
 
     private HandlerThread bgThread;
     private Handler bgHandler;
+    private HandlerThread analysisThread;
+    private Handler analysisHandler;
+    private ImageReader analysisReader;
+    private Size analysisSize;
+    private final AutoCaptureGate gate = new AutoCaptureGate();
+    private boolean autoCapture = true;
+    private boolean autoAvailable;
+    private long lastAnalysisMs;
+    private String lastStatus = "";
+    private volatile boolean afFocused;
+    private volatile boolean afKnown;
     private CameraManager cameraManager;
     private CameraDevice cameraDevice;
     private CameraCaptureSession captureSession;
@@ -178,6 +198,8 @@ public class CameraActivity extends Activity {
         captureButton = new Button(this);
         captureButton.setText("Capture " + ("left".equals(eye) ? "left" : "right") + " eye");
         captureButton.setOnClickListener(v -> captureStill());
+        autoButton = new Button(this);
+        autoButton.setOnClickListener(v -> toggleAutoCapture());
         Button cancel = new Button(this);
         cancel.setText("Cancel");
         cancel.setOnClickListener(v -> {
@@ -185,12 +207,18 @@ public class CameraActivity extends Activity {
             finish();
         });
         buttons.addView(torchButton);
+        buttons.addView(autoButton);
         buttons.addView(captureButton);
         buttons.addView(cancel);
         bottom.addView(buttons);
         FrameLayout.LayoutParams bottomLp = new FrameLayout.LayoutParams(-1, -2);
         bottomLp.gravity = Gravity.BOTTOM;
         root.addView(bottom, bottomLp);
+
+        // Auto-capture preference, default ON (Adam asked for it).
+        autoCapture = getSharedPreferences("eyeknow_camera", MODE_PRIVATE)
+                .getBoolean("auto_capture", true);
+        updateAutoButton();
 
         setContentView(root);
 
@@ -254,6 +282,9 @@ public class CameraActivity extends Activity {
         bgThread = new HandlerThread("eyeknow-camera");
         bgThread.start();
         bgHandler = new Handler(bgThread.getLooper());
+        analysisThread = new HandlerThread("eyeknow-analysis");
+        analysisThread.start();
+        analysisHandler = new Handler(analysisThread.getLooper());
     }
 
     private void stopBackground() {
@@ -262,6 +293,12 @@ public class CameraActivity extends Activity {
             try { bgThread.join(); } catch (InterruptedException ignored) {}
             bgThread = null;
             bgHandler = null;
+        }
+        if (analysisThread != null) {
+            analysisThread.quitSafely();
+            try { analysisThread.join(); } catch (InterruptedException ignored) {}
+            analysisThread = null;
+            analysisHandler = null;
         }
     }
 
@@ -338,12 +375,15 @@ public class CameraActivity extends Activity {
                 fail("This camera reports no usable sizes.");
                 return;
             }
+            analysisSize = pickAnalysisSize(map.getOutputSizes(ImageFormat.YUV_420_888));
+            autoAvailable = analysisSize != null;
             torchOn = backFacing && hasFlash; // torch on by default, rear only
             runOnUiThread(() -> {
                 cameraLine.setText(choice.label + " camera — " + choice.reason);
                 torchButton.setText("Flash: " + (torchOn ? "on" : "off"));
                 torchButton.setEnabled(hasFlash);
                 zoomSlider.setEnabled(maxZoom > 1f);
+                updateAutoButton();
             });
         } catch (CameraAccessException e) {
             fail("Could not read this camera's details: " + e.getMessage());
@@ -387,6 +427,27 @@ public class CameraActivity extends Activity {
         return best;
     }
 
+    /** Smallest YUV size in the 320-640 wide band the detector
+     *  wants; falls back to the smallest size the camera offers.
+     *  Analysis downscales to 320 wide anyway, so a bigger buffer
+     *  only costs memory and copy time. */
+    private Size pickAnalysisSize(Size[] sizes) {
+        if (sizes == null || sizes.length == 0) return null;
+        Size best = null;
+        for (Size s : sizes) {
+            if (s.getWidth() < 320 || s.getWidth() > 640) continue;
+            if (best == null || (long) s.getWidth() * s.getHeight()
+                    < (long) best.getWidth() * best.getHeight()) best = s;
+        }
+        if (best != null) return best;
+        best = sizes[0];
+        for (Size s : sizes) {
+            if ((long) s.getWidth() * s.getHeight()
+                    < (long) best.getWidth() * best.getHeight()) best = s;
+        }
+        return best;
+    }
+
     private void startSession() {
         if (closed) return;
         try {
@@ -418,6 +479,10 @@ public class CameraActivity extends Activity {
     }
 
     private void createSession() {
+        createSessionInternal(true);
+    }
+
+    private void createSessionInternal(boolean includeAnalysis) {
         if (cameraDevice == null || closed) return;
         try {
             SurfaceTexture st = textureView.getSurfaceTexture();
@@ -425,24 +490,37 @@ public class CameraActivity extends Activity {
             st.setDefaultBufferSize(previewSize.getWidth(), previewSize.getHeight());
             applyPreviewTransform();
             Surface previewSurface = new Surface(st);
-            stillReader = ImageReader.newInstance(stillSize.getWidth(), stillSize.getHeight(),
-                    ImageFormat.JPEG, 2);
-            stillReader.setOnImageAvailableListener(reader -> {
-                Image img = null;
-                try {
-                    img = reader.acquireLatestImage();
-                    if (img != null) saveStill(img);
-                } catch (Exception e) {
-                    onCaptureFailed("Could not read the captured photo: " + e.getMessage());
-                } finally {
-                    if (img != null) img.close();
-                }
-            }, bgHandler);
+            if (stillReader == null) {
+                stillReader = ImageReader.newInstance(stillSize.getWidth(),
+                        stillSize.getHeight(), ImageFormat.JPEG, 2);
+                stillReader.setOnImageAvailableListener(reader -> {
+                    Image img = null;
+                    try {
+                        img = reader.acquireLatestImage();
+                        if (img != null) saveStill(img);
+                    } catch (Exception e) {
+                        onCaptureFailed("Could not read the captured photo: " + e.getMessage());
+                    } finally {
+                        if (img != null) img.close();
+                    }
+                }, bgHandler);
+            }
+            List<Surface> targets = new ArrayList<>();
+            targets.add(previewSurface);
+            targets.add(stillReader.getSurface());
+            if (includeAnalysis && autoAvailable && analysisReader == null
+                    && analysisHandler != null) {
+                analysisReader = ImageReader.newInstance(analysisSize.getWidth(),
+                        analysisSize.getHeight(), ImageFormat.YUV_420_888, 2);
+                analysisReader.setOnImageAvailableListener(
+                        this::analyzeFrame, analysisHandler);
+                targets.add(analysisReader.getSurface());
+            }
             previewBuilder = cameraDevice.createCaptureRequest(CameraDevice.TEMPLATE_PREVIEW);
             previewBuilder.addTarget(previewSurface);
             applyPreviewSettings(previewBuilder);
             cameraDevice.createCaptureSession(
-                    Arrays.asList(previewSurface, stillReader.getSurface()),
+                    targets,
                     new CameraCaptureSession.StateCallback() {
                         @Override
                         public void onConfigured(CameraCaptureSession session) {
@@ -450,19 +528,99 @@ public class CameraActivity extends Activity {
                             try {
                                 session.setRepeatingRequest(previewBuilder.build(),
                                         captureCallback, bgHandler);
-                                setStatus("Ready — center the eye in the ring, hold steady.");
+                                if (autoCapture && autoAvailable) {
+                                    setStatus("Looking for the iris — center the eye in the ring.");
+                                } else if (!autoAvailable) {
+                                    setStatus("Auto-capture isn't available on this camera — "
+                                            + "use the Capture button.");
+                                } else {
+                                    setStatus("Ready — center the eye in the ring, hold steady.");
+                                }
                             } catch (CameraAccessException e) {
                                 fail("The camera preview could not start: " + e.getMessage());
                             }
                         }
                         @Override
                         public void onConfigureFailed(CameraCaptureSession session) {
+                            if (includeAnalysis && !closed) {
+                                // Some cameras cannot run preview + YUV +
+                                // JPEG together. Retry without the
+                                // analysis target: manual capture must
+                                // never be bricked by auto-capture.
+                                if (analysisReader != null) {
+                                    analysisReader.close();
+                                    analysisReader = null;
+                                }
+                                autoAvailable = false;
+                                runOnUiThread(() -> updateAutoButton());
+                                createSessionInternal(false);
+                                return;
+                            }
                             fail("The camera preview could not start.");
                         }
                     }, bgHandler);
         } catch (CameraAccessException e) {
             fail("The camera session could not start: " + e.getMessage());
         }
+    }
+
+    /** Runs on the analysis thread. Throttled to ~5 fps, latest
+     *  frame only; never blocks the preview. Any exception here
+     *  must stay local — analysis never breaks the camera. */
+    private void analyzeFrame(ImageReader reader) {
+        Image img = null;
+        try {
+            img = reader.acquireLatestImage();
+            if (img == null) return;
+            if (!autoCapture || !autoAvailable || capturing || gate.hasFired()) return;
+            long now = SystemClock.uptimeMillis();
+            if (now - lastAnalysisMs < 200) return;
+            lastAnalysisMs = now;
+            Image.Plane[] planes = img.getPlanes();
+            if (planes.length < 3) return;
+            IrisFrame frame = YuvFrame.convert(img.getWidth(), img.getHeight(),
+                    planes[0].getBuffer(), planes[0].getRowStride(),
+                    planes[1].getBuffer(), planes[1].getRowStride(), planes[1].getPixelStride(),
+                    planes[2].getBuffer(), planes[2].getRowStride(), planes[2].getPixelStride());
+            IrisDetector.Result r = IrisDetector.detect(frame);
+            AutoCaptureGate.State state = gate.feed(r, afFocused, afKnown);
+            onGateState(state, r);
+        } catch (Exception ignored) {
+            // Analysis failures stay silent; the manual shutter remains.
+        } finally {
+            if (img != null) img.close();
+        }
+    }
+
+    /** Gate states drive the status line while auto-capture is
+     *  active. The FIRED state takes the still through the exact
+     *  manual path — crop step included. */
+    private void onGateState(AutoCaptureGate.State state, IrisDetector.Result r) {
+        runOnUiThread(() -> {
+            switch (state) {
+                case SEARCHING:
+                    setStatus("Looking for the iris — center the eye in the ring.");
+                    break;
+                case FOUND:
+                    setStatus("Iris found — move closer so it fills the ring.");
+                    break;
+                case FOCUSING:
+                    if (r.meanLum < 30) {
+                        setStatus("Too dark to focus — move closer to the light.");
+                    } else {
+                        setStatus("Iris found — focusing… hold still.");
+                    }
+                    break;
+                case STEADY:
+                    setStatus("Hold steady… " + gate.steadyCount()
+                            + "/" + AutoCaptureGate.STEADY_FRAMES);
+                    break;
+                case FIRED:
+                    setStatus("Captured.");
+                    captureStill();
+                    break;
+            }
+        });
     }
 
     /** Center-crop the preview into the TextureView without
@@ -509,8 +667,20 @@ public class CameraActivity extends Activity {
                 public void onCaptureCompleted(CameraCaptureSession session,
                                                CaptureRequest request, TotalCaptureResult result) {
                     Integer af = result.get(CaptureResult.CONTROL_AF_STATE);
+                    if (af != null) {
+                        // AF state feeds the auto-capture gate: focused
+                        // means FOCUSED_LOCKED or PASSIVE_FOCUSED; a
+                        // fixed-focus lens never reports any state but
+                        // INACTIVE, and the gate must not wait forever.
+                        if (af != CaptureResult.CONTROL_AF_STATE_INACTIVE) afKnown = true;
+                        afFocused = af == CaptureResult.CONTROL_AF_STATE_FOCUSED_LOCKED
+                                || af == CaptureResult.CONTROL_AF_STATE_PASSIVE_FOCUSED;
+                    }
                     if (af != null && af != lastAfState) {
                         lastAfState = af;
+                        // While auto-capture is active the gate owns
+                        // the status line; AF chatter must not stomp it.
+                        if (autoCapture && autoAvailable) return;
                         String s = null;
                         if (af == CaptureResult.CONTROL_AF_STATE_FOCUSED_LOCKED
                                 || af == CaptureResult.CONTROL_AF_STATE_PASSIVE_FOCUSED) {
@@ -528,6 +698,27 @@ public class CameraActivity extends Activity {
             };
 
     // ------------------------------------------------------------ controls
+
+    private void toggleAutoCapture() {
+        autoCapture = !autoCapture;
+        getSharedPreferences("eyeknow_camera", MODE_PRIVATE)
+                .edit().putBoolean("auto_capture", autoCapture).apply();
+        gate.reset();
+        updateAutoButton();
+        if (autoCapture && autoAvailable) {
+            setStatus("Looking for the iris — center the eye in the ring.");
+        } else if (!autoAvailable) {
+            setStatus("Auto-capture isn't available on this camera — use the Capture button.");
+        } else {
+            setStatus("Auto-capture off — use the Capture button.");
+        }
+    }
+
+    private void updateAutoButton() {
+        if (autoButton == null) return;
+        autoButton.setEnabled(autoAvailable);
+        autoButton.setText("Auto: " + (autoCapture ? "on" : "off"));
+    }
 
     private void toggleTorch() {
         if (!hasFlash) return;
@@ -671,6 +862,7 @@ public class CameraActivity extends Activity {
 
     private void onCaptureFailed(String message) {
         capturing = false;
+        gate.reset(); // a failed capture must not latch auto-capture off
         runOnUiThread(() -> {
             Toast.makeText(this, message, Toast.LENGTH_LONG).show();
             setStatus("Capture failed — try again.");
@@ -684,6 +876,7 @@ public class CameraActivity extends Activity {
         if (resultCode == CropActivity.RESULT_RETAKE) {
             if (pendingRawFile != null) pendingRawFile.delete();
             pendingRawFile = null;
+            gate.reset(); // a fresh stability window for the retake
             setStatus("Ready — center the eye in the ring, hold steady.");
             return;
         }
@@ -706,8 +899,14 @@ public class CameraActivity extends Activity {
 
     // ------------------------------------------------------------ lifecycle
 
+    /** Status line with dedup: the gate feeds at ~5 fps, and
+     *  re-setting the same text every feed would churn the UI. */
     private void setStatus(final String s) {
-        runOnUiThread(() -> statusLine.setText(s));
+        runOnUiThread(() -> {
+            if (s.equals(lastStatus)) return;
+            lastStatus = s;
+            statusLine.setText(s);
+        });
     }
 
     private void fail(String message) {
@@ -721,6 +920,9 @@ public class CameraActivity extends Activity {
     protected void onResume() {
         super.onResume();
         closed = false;
+        gate.reset(); // a fresh stability window each time we return
+        afKnown = false;
+        afFocused = false;
         if (cameraDevice == null && bgHandler == null) {
             startBackground();
             openCamera();
@@ -760,6 +962,12 @@ public class CameraActivity extends Activity {
             if (stillReader != null) {
                 stillReader.close();
                 stillReader = null;
+            }
+        } catch (Exception ignored) {}
+        try {
+            if (analysisReader != null) {
+                analysisReader.close();
+                analysisReader = null;
             }
         } catch (Exception ignored) {}
     }

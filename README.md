@@ -2,7 +2,8 @@
 
 A native Android shell for [eyeknow.app](https://www.eyeknow.app) with a
 native iris camera: macro lens selection, flash, autofocus, zoom into
-the iris, a square crop step, and submission straight into the eyeKnow
+the iris, auto-capture when an iris is detected in focus, a square crop
+step, and submission straight into the eyeKnow
 reading flow through the site's native-capture bridge.
 
 - App ID: `app.eyeknow.android` (from Adam's Android starter)
@@ -29,9 +30,14 @@ and must never be committed — this repo is public.
 
 ## Status
 
-v1.0 (2026-11-15): first build. The native camera activates when the
-site's bridge code deploys (the Eyeknow repo's `main` branch needs
-the duplicate `nativeCapture.ts` removed and the line-66 guard
-applied first — Adam's GitHub action). Until then the shell runs
-the site's web camera / upload fallback. Camera behavior on real
+v1.1 (2026-11-15): auto-capture. The camera fires the still itself
+when the web reader's own decision logic — ported to pure Java —
+sees an iris in focus and steady for ~0.8 s. Manual capture always
+remains; auto-capture toggles off. Real-eye detection, focus
+accuracy, false triggers, and A16 performance are unverified —
+the Galaxy A16 is the first test.
+
+v1.0 (2026-11-15): first build. The site's bridge code is live
+(the Eyeknow `main` fix deployed 2026-11-15), so the native
+camera activates with no app update. Camera behavior on real
 hardware is unverified — the Galaxy A16 is the first test.
